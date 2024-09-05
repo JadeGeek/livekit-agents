@@ -9,7 +9,7 @@ from typing import Any, AsyncIterable, Awaitable, Callable, Literal, Optional, U
 from livekit import rtc
 
 from .. import stt, tokenize, tts, utils, vad
-from ..llm import LLM, ChatContext, ChatMessage, FunctionContext, LLMStream
+from ..llm import LLM, ChatContext, ChatMessage, FunctionContext, LLMStream, ChatChunk, Choice, ChoiceDelta
 from .agent_output import AgentOutput, SynthesisHandle
 from .agent_playout import AgentPlayout
 from .human_input import HumanInput
@@ -21,6 +21,8 @@ WillSynthesizeAssistantReply = Callable[
     ["VoiceAssistant", ChatContext],
     Union[Optional[LLMStream], Awaitable[Optional[LLMStream]]],
 ]
+
+PreCheckLLMReply = Callable[[LLMStream], Awaitable[LLMStream]]
 
 EventTypes = Literal[
     "user_started_speaking",
@@ -79,6 +81,7 @@ class _ImplOptions:
     will_synthesize_assistant_reply: WillSynthesizeAssistantReply
     plotting: bool
     transcription: AssistantTranscriptionOptions
+    pre_check_llm_reply: PreCheckLLMReply
 
 
 @dataclass(frozen=True)
@@ -120,6 +123,7 @@ class VoiceAssistant(utils.EventEmitter[EventTypes]):
         preemptive_synthesis: bool = True,
         transcription: AssistantTranscriptionOptions = AssistantTranscriptionOptions(),
         will_synthesize_assistant_reply: WillSynthesizeAssistantReply = _default_will_synthesize_assistant_reply,
+        pre_check_llm_reply: PreCheckLLMReply | None = None,
         plotting: bool = False,
         loop: asyncio.AbstractEventLoop | None = None,
     ) -> None:
@@ -141,6 +145,7 @@ class VoiceAssistant(utils.EventEmitter[EventTypes]):
             transcription: Options for assistant transcription.
             will_synthesize_assistant_reply: Callback called when the assistant is about to synthesize a reply.
                 This can be used to customize the reply (e.g: inject context/RAG).
+            pre_check_llm_reply: Callback called to pre-check the LLM reply before synthesizing the speech.
             plotting: Whether to enable plotting for debugging. matplotlib must be installed.
             loop: Event loop to use. Default to asyncio.get_event_loop().
         """
@@ -154,6 +159,7 @@ class VoiceAssistant(utils.EventEmitter[EventTypes]):
             preemptive_synthesis=preemptive_synthesis,
             transcription=transcription,
             will_synthesize_assistant_reply=will_synthesize_assistant_reply,
+            pre_check_llm_reply=pre_check_llm_reply or self._default_pre_check_llm_reply,
         )
         self._plotter = AssistantPlotter(self._loop)
 
@@ -485,8 +491,11 @@ class VoiceAssistant(utils.EventEmitter[EventTypes]):
                 self, chat_ctx=copied_ctx
             )
 
-        synthesis_handle = self._synthesize_agent_speech(handle.id, llm_stream)
-        handle.initialize(source=llm_stream, synthesis_handle=synthesis_handle)
+        # Pre-check the LLM reply using the provided or default function
+        pre_checked_llm_stream = await self._opts.pre_check_llm_reply(llm_stream)
+
+        synthesis_handle = self._synthesize_agent_speech(handle.id, pre_checked_llm_stream)
+        handle.initialize(source=pre_checked_llm_stream, synthesis_handle=synthesis_handle)
 
         # TODO(theomonnom): Find a more reliable way to get the elapsed time from the last end of speech
         # (VAD could not have detected any speech - maybe unlikely?)
@@ -503,6 +512,17 @@ class VoiceAssistant(utils.EventEmitter[EventTypes]):
                 "elapsed": elapsed,
             },
         )
+
+    async def _default_pre_check_llm_reply(self, llm_stream: LLMStream) -> LLMStream:
+        # This is a placeholder implementation that simply returns the input stream
+        # You can add custom logic here if needed
+        return llm_stream
+
+    def _create_llm_stream_from_text(self, text: str) -> LLMStream:
+        async def stream_generator():
+            yield ChatChunk(choices=[Choice(delta=ChoiceDelta(content=text))])
+
+        return LLMStream(aiter(stream_generator()))
 
     async def _play_speech(self, speech_handle: SpeechHandle) -> None:
         try:
